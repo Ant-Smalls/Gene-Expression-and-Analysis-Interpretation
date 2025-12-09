@@ -16,7 +16,7 @@ The analysis follows a comprehensive pipeline, moving from raw RNA-seq counts to
 * **Preprocessing:** Raw counts were filtered for low expression and normalized using the size-factor estimation from the **DESeq2** package (Love *et al.*, 2014).
 
 ### 2. Differential Expression (DE) Analysis
-* **Model:** Differential expression was calculated using the **DESeq2** package (Love *et al.*, 2014) comparing $\texttt{Amplified}$ vs. $\texttt{Non\_Amplified}$ status.
+* **Model:** Differential expression was calculated using the **DESeq2** package (Love *et al.*, 2014) comparing Amplified vs. Non-Amplified status.
 * **Significance:** Genes were deemed differentially expressed if the **Adjusted $p$-value ($p_{adj}$) was $< 0.05$.**
 * **Gene Ranking:** The top genes were ranked by the absolute magnitude of the $\mathbf{\text{log}_2\text{Fold Change}}$ ($|\text{LFC}|$) to prioritize genes with the strongest biological effects.
 
