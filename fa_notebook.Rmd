@@ -1,0 +1,468 @@
+---
+Author: 'Anthony Smaldore'
+title: "Final assignment: Gene Expression Analysis and Interpretation"
+Due Date: 20/12/2025
+output: html_notebook
+---
+Before performing this analysis, the Breast Invasive Carcinoma TCGA PanCancer data set was downloaded and placed in a local directory:
+
+The dataset can be downloaded from this link as of 06/12/2025: https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018 
+
+Set up the packages needed for the notebook. Install and then import the following packages (Note. installation of packages that have previously been installed may require updating):
+
+```{r}
+# install and import packages needed
+install.packages("dplyr")
+install.packages("tidyr")
+install.packages("BiocManager")
+BiocManager::install("DESeq2")
+BiocManager::install("clusterProfiler")
+BiocManager::install("org.Hs.eg.db")
+install.packages("enrichplot")
+BiocManager::install("pathview")
+BiocManager::install("ReactomePA")
+install.packages("pheatmap")
+install.packages("glmnet")
+install.packages("stringr")
+
+library(dplyr)
+library(tidyr)
+library(DESeq2)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(pathview)
+library(pheatmap)
+library(survival)
+library(glmnet)
+library(stringr)
+```
+
+Next, load in the Breast Invasive Carcinoma data set from the local machine by decompressing the download loaded file and then providing the folder path and subsequent file paths needed for the files used in analysis which include:
+data_mrna_seq_v2_rsem.txt 
+data_clinical_patient.txt
+data_cna.txt
+```{r}
+# exact location on the computer for the dataset file
+file_path = '/Users/ant-smalls/Desktop/UCD-Autumn/ANAT40040- Bio principles and Cellular Organization/final_assignment/data/brca_tcga_pan_can_atlas_2018.tar'
+
+# decompress tar.gz 
+untar(file_path, exdir = '/Users/ant-smalls/Desktop/UCD-Autumn/ANAT40040- Bio principles and Cellular Organization/final_assignment/data')
+
+# path to the folder result from untaring
+folder_path = '/Users/ant-smalls/Desktop/UCD-Autumn/ANAT40040- Bio principles and Cellular Organization/final_assignment/data/brca_tcga_pan_can_atlas_2018'
+
+# extract all files needed - notice the first 4 lines of patient data were skipped as the 5th line is the correct column identifiers
+rna_seq_path = paste(folder_path,"data_mrna_seq_v2_rsem.txt", sep = "/") 
+patient_data_path = paste(folder_path, "data_clinical_patient.txt", sep = "/")
+copy_num_aberr_path = paste(folder_path, "data_cna.txt", sep = "/")
+
+rna_seq_data = read.delim(rna_seq_path)
+patient_data = read.delim(patient_data_path, skip = 4, header = TRUE)
+copy_num_aberr_data = read.delim(copy_num_aberr_path)
+```
+
+After reading in the necessary files, use each of the files to extract the patient IDs and then match them to create a unique list of all the patient IDs from the dataset.
+
+```{r}
+# rna_seq_data: grab the patient names from all columns minus the first two (gene identifiers); extract patient id, replace with the patient id format matching patient_data 
+copy_rna_seq_data <- rna_seq_data
+rna_ids_raw <- colnames(copy_rna_seq_data)[-(1:2)]
+rna_ids <- gsub("\\.", "-", rna_ids_raw) 
+rna_ids <- sub(".{3}$", "", rna_ids)
+
+# copy_num_aberr_data: grab the patient names from all columns minus the first two; extract patient id, replace with the patient id format matching patient_data
+copy_copy_num_aberr_data <- copy_num_aberr_data
+cna_ids_raw <- colnames(copy_copy_num_aberr_data)[-(1:2)]
+cna_ids <- gsub("\\.", "-", cna_ids_raw) 
+cna_ids <- sub(".{3}$", "", cna_ids)
+
+colnames(copy_copy_num_aberr_data)[-(1:2)] <- cna_ids
+
+matched_patients <- intersect(rna_ids,cna_ids)
+matched_patients <- intersect(matched_patients, patient_data$PATIENT_ID)
+```
+Before doing any analysis, create metadata that will group the samples and matched patients into two groups: ERBB2 'Amplified' or ERBB2 'Non_Amplified'; categorized by the CNA level being > 0 (Amplified) or < 0 (Non_Amplified)
+
+```{r}
+# create metadata with CNA level of ERBB2+ (with greater > 0 means amplified; lower < 0 means non-amplified)
+# find the erbb2 rows for all of our matched patients
+erbb2 <- copy_copy_num_aberr_data %>%
+  filter(Hugo_Symbol == "ERBB2") %>%
+  dplyr::select(Hugo_Symbol, all_of(matched_patients))
+
+# convert from categorical vector to a numeric vector
+erbb2_vals <- erbb2 %>%
+  dplyr::select(all_of(matched_patients)) %>%  
+  unlist(use.names = FALSE) %>%             
+  as.numeric()
+
+# build a metadata data frame keyed by PATIENT_ID
+erbb2_metadata <- data.frame(
+  PATIENT_ID = matched_patients,
+  ERBB2_CNA  = erbb2_vals,
+  ERBB2_amp  = erbb2_vals > 0,   # TRUE if amplified, FALSE otherwise
+  stringsAsFactors = FALSE
+)
+
+
+```
+
+
+Additional steps are needed to prepare for the data analysis techniques, specifically for analyzing differentially expressed genes:
+
+- use the metadata's amplification status feature to create a factor label with the 'Amplified' or 'Non_Amplified' label
+- set the reference level to 'Non_Amplified' to be used for the differential expression calculations
+- set the rownames of the output to matched patient IDs
+- clean the raw RNA sequencing data by replacing any missing values or negative values for the RNA-seq reads as 0
+- - also, get rid of the genes that have more than 3 values missing
+- re-organize the RNA-seq data and update the metadata 
+
+Finally, create the deseq data object that contains the RNA-seq data with our matched patients, with the goal of extracting the differentially expressed genes between the levels of ERBB2 Non_Amplfied (base level) and Amplified 
+
+
+```{r}
+# DESeq preparation steps
+# convert the logical column to a factor with labels used for deseq 
+erbb2_metadata$ERBB2_Status <- factor(
+  erbb2_metadata$ERBB2_amp,
+  levels = c(FALSE, TRUE),
+  labels = c("Non_Amplified", "Amplified")
+)
+
+# set the reference level and rownames as the patient_ids for use in deseq
+erbb2_metadata$ERBB2_Status <- relevel(erbb2_metadata$ERBB2_Status, ref = "Non_Amplified")
+rownames(erbb2_metadata) <- erbb2_metadata$PATIENT_ID
+
+# clean the raw data by imputing the NA values and removing genes with too many missing values
+gene_ids <- rna_seq_data[, 1]
+assay = round(as.matrix(rna_seq_data[,-c(1,2)])) 
+assay[is.na(assay)] = 0  
+assay[assay<0] = 0
+
+smallestGroupSize = 3
+keep = rowSums(assay >= 10) >= smallestGroupSize
+assay = assay[keep,]
+gene_ids_filtered <- gene_ids[keep]
+
+# rename the column names of the raw data to the patient_ids, rownames to gene names, order raw data / metadata by matching patients 
+colnames(assay) <- rna_ids
+rownames(assay) <- gene_ids_filtered
+assay <- assay[, matched_patients]
+erbb2_metadata <- erbb2_metadata[matched_patients, ]
+
+# create deseq object needed for differential expression 
+dds =  DESeqDataSetFromMatrix(countData = assay,
+                              colData = erbb2_metadata,
+                              design = ~ ERBB2_Status)
+
+```
+
+Now, normalize the data using the deseq object, dds, and obtain the coefficients. Then, perform the differential expression analysis with the normalized RNA-seq data. Then perform and show the following:
+
+- Display the number of patients who are ampligied vs non-amplified
+- Then, obtain the subset of the differentially expressed genes with the most significant genes that have the adjusted p-value under 0.05 to account for all the statistical tests done and potentially high false positive rate
+- Display the top 10 most differentially expressed genes that are significant in reference to ERBB2 and according to their log2FoldChange absolute value 
+
+```{r}
+
+# normalize data and list the coefficients
+dds <- DESeq(dds)
+resultsNames(dds) 
+
+# display number of Amplified vs Non_Amplified patients used for differential expression
+patient_counts <- erbb2_metadata %>%
+  group_by(ERBB2_Status) %>%
+  summarise(Count = n())
+
+print(patient_counts)
+
+# obtain the differentially expressed genes and display the top 10 most differentially expressed ranked by log2FoldChange
+res = results(dds)
+res_sig = res[res$padj<0.05,]
+res_sig[order(abs(res_sig$log2FoldChange), decreasing = TRUE)[1:10],]
+```
+
+With this subset of the significant differentially expressed genes, the following results can be displayed:
+
+- Total count of these genes that are Over-Expressed 
+- Total count of these genes that are Under-Expressed 
+- Total count of genes that are statistically significant in relation to the padj value of 0.05
+```{r}
+
+# minimum magnitude for reporting
+lfc_report_cutoff <- 0.0
+
+# count Over-Expressed Genes and Under-Expressed Genes
+over_expressed_count_report <- res_sig %>%
+  as.data.frame() %>%
+  filter(log2FoldChange > lfc_report_cutoff) %>%
+  nrow()
+
+under_expressed_count_report <- res_sig %>%
+  as.data.frame() %>%
+  filter(log2FoldChange < lfc_report_cutoff) %>%
+  nrow()
+
+# display results of significant Genes (LFC is NOT = 0)
+all_sig_count <- nrow(res_sig)
+print(paste("Total Over-Expressed Significant Genes(LFC >", lfc_report_cutoff, "):", over_expressed_count_report))
+print(paste("Total Under-Expressed Significant Genes (LFC <", lfc_report_cutoff, "):", under_expressed_count_report))
+print(paste("Total Significant Genes (p.adj < 0.05):", all_sig_count))
+
+```
+
+
+With differentially expressed genes that are significant, perform a deep dive into the biological functions and more specifically, biological pathways that are affected due to the ERBB2 amplification or Non_Amplification:
+
+- with these genes, perform a high level gene ontology analysis to obtain the over-expressed and under-expressed genes 
+
+```{r}
+# get a subset of the differentially expressed genes 
+res_sig = res[res$padj<0.05,]
+
+# separate into over and under expressed using log2foldchange
+DE_over = rownames(res_sig[res_sig$log2FoldChange>0,])
+DE_under = rownames(res_sig[res_sig$log2FoldChange<0,])
+
+# perform the gene ontology enrichment for the over-expressed genes and then the under-expressed genes 
+# over-expressed
+go_results_over = enrichGO(
+  gene          = DE_over,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",  
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+# under-expressed 
+go_results_under = enrichGO(
+  gene          = DE_under,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",  
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+# minimum magnitude for reporting
+lfc_report_cutoff <- 0.0
+
+# count Over-Expressed Genes and Under-Expressed Genes
+over_expressed_count_report <- res_sig %>%
+  as.data.frame() %>%
+  filter(log2FoldChange > lfc_report_cutoff) %>%
+  nrow()
+
+under_expressed_count_report <- res_sig %>%
+  as.data.frame() %>%
+  filter(log2FoldChange < lfc_report_cutoff) %>%
+  nrow()
+
+# display results of significant Genes (LFC is NOT = 0)
+all_sig_count <- nrow(res_sig)
+print(paste("Total Over-Expressed (LFC >", lfc_report_cutoff, "):", over_expressed_count_report))
+print(paste("Total Under-Expressed (LFC <", lfc_report_cutoff, "):", under_expressed_count_report))
+print(paste("Total Significant Genes (p.adj < 0.05):", all_sig_count))
+
+
+# print and plot results for both
+print(head(go_results_over))
+print(head(go_results_under))
+dotplot(go_results_over, showCategory=10) + ggtitle("Gene Ontology Enrichment Over Expressed")
+dotplot(go_results_under, showCategory=10) + ggtitle("Gene Ontology Enrichment Under Expressed")
+
+```
+
+Additionally, use the differentially expressed genes with the KEGG and Reactome databases to find the specific pathways that are being affected:
+
+- for KEGG and Reactome, use the Entrez_ID to work with these databases. Formulate these IDs based on the over-expressed and under-expressed genes
+- perform the pathway analysis using KEGG's database with the over-expressed and under-expressed genes
+- then, perform the pathway analysis again except using Reactome's database with the over-expressed and under-expressed genes
+
+
+```{r}
+# use the Entrez_ID to map the genes to be used for comparision in the Reactome and Kegg databases
+# Convert the Entrez_ID to the required form 
+gene_entrez_over <- bitr(
+  DE_over,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+gene_entrez_under <- bitr(
+  DE_under,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+# pathway enrichment for Kegg
+# over-expressed genes
+kegg_results_over =  enrichKEGG(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+# under-expressed genes 
+kegg_results_under =  enrichKEGG(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+# pathway enrichment for Reactome
+# over-expressed genes
+reactome_results_over =  enrichPathway(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+
+# under-expressed genes 
+reactome_results_under =  enrichPathway(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+
+# display descriptive and visual results from enrichment of both pathways
+# Kegg over-expressed and under-expressed 
+print(head(kegg_results_over))
+dotplot(kegg_results_over, showCategory=10) + ggtitle("Kegg Pathway Enrichment Over Expressed")
+print(head(kegg_results_under))
+dotplot(kegg_results_under, showCategory=10) + ggtitle("Kegg Pathway Enrichment Under Expressed")
+
+# Reactome over-expressed and under-expressed
+print(head(reactome_results_over))
+dotplot(reactome_results_over, showCategory=10) + ggtitle("Reactome Pathway Enrichment Over Expressed")
+print(head(reactome_results_under))
+dotplot(reactome_results_under, showCategory=10) + ggtitle("Reactome Pathway Enrichment Under Expressed")
+
+```
+
+Next, use our normalized RNA-seq coefficients to obtain the variance stabilized transformed (vst) gene expression values which are transformed variance values that are balanced across the wide range of raw gene expression levels
+
+Display the vst values in two different forms of plots:
+
+- Principal Component Analysis (PCA)
+- Heatmap 
+
+
+```{r}
+
+# Get the variance stabilized transformed expression values
+vsd = vst(dds)
+
+# Plot the vst values with PCA plot and heatmap
+# PCA
+par(mfrow = c(1, 2))
+plotPCA(vsd, intgroup="ERBB2_Status")
+
+# heatmap
+# use vst values of the top 20 differentially expressed genes and the ERBB2 status to plot the heatmap
+top_DE = order(res$padj)
+vsd_DE = assay(vsd)[top_DE[1:20],]
+annotation_col <- data.frame(
+  ERBB2_Status = colData(vsd)$ERBB2_Status
+)
+
+# set row names to match gene names from vst values
+rownames(annotation_col) <- colnames(vsd)
+
+pheatmap(
+  vsd_DE,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = 'row',
+  show_colnames = FALSE,
+  annotation_col = annotation_col
+)
+```
+
+
+Finally, using the vst values perform a survival analysis. 
+
+- First, find and add the survival columns needed: OS_MONTHS (Overall survival in months) and OS_STATUS (Overall survival status)
+- Convert the status to a numerical value (0 or 1) to be used in the survival analysis and clean the newly added columns in the metadata
+- Use the differentially expressed genes and matched patients to form a new matrix containing the vst values for these differentially expressed genes and our matching patients 
+- - transpose this vst matrix since it is necessary when used for survival analysis 
+- create the survival object and perform the cross-validated Lasso regression to obtain the coefficients of the minimum cross validation error and present display the non-zero coefficients  
+
+
+```{r}
+
+# Use vst values of the differentially expressed genes to generate an overall survival model using the glmnet package
+# select the necessary survival columns from the main patient data
+survival_cols <- patient_data %>%
+  dplyr::select(PATIENT_ID, OS_MONTHS, OS_STATUS)
+
+# merge survival data into erbb2_metadata
+erbb2_metadata <- merge(erbb2_metadata, survival_cols, by="PATIENT_ID", all.x=TRUE)
+
+# extract / save the numerical survival status and convert to numerical for surv object 
+erbb2_metadata$OS_NUM_STATUS <- str_extract(
+  erbb2_metadata$OS_STATUS,
+  "^[0-9]" 
+)
+erbb2_metadata$OS_NUM_STATUS <- as.numeric(erbb2_metadata$OS_NUM_STATUS)
+
+# make sure survival columns are cleaned and only include our matched patients
+survival_na <- (is.na(erbb2_metadata$OS_MONTHS) | is.na(erbb2_metadata$OS_NUM_STATUS) | erbb2_metadata$OS_MONTHS <= 0)
+erbb2_metadata_final <- erbb2_metadata[!survival_na, ]
+
+# re-align the assay and the metadata to this cleaned patient list
+final_patients <- erbb2_metadata_final$PATIENT_ID
+assay <- assay[, final_patients]
+erbb2_metadata <- erbb2_metadata_final
+
+# extract all significant differentially expressed genes for survival analysis
+vst_matrix <- assay(vsd)
+sig_genes_list <- rownames(res[which(res$padj < 0.05), ])
+
+# get the vst matrix for differentially expressed genes and according to the filtered patients 
+vst_de_matrix <- vst_matrix[sig_genes_list, final_patients]
+
+# transpose (rows = samples, cols = genes)
+X_matrix <- t(vst_de_matrix)
+
+# calculate the variance and keep only genes with non-zero variance
+gene_variances <- apply(X_matrix, 2, var)
+genes_to_keep <- gene_variances > 0
+X_matrix <- X_matrix[, genes_to_keep]
+
+# create the survival object
+survival_data <- Surv(
+  time = erbb2_metadata$OS_MONTHS,
+  event = erbb2_metadata$OS_NUM_STATUS
+)
+
+# perform cross-validated Lasso regression with cox's proportional lasso method 
+fit_lasso <- cv.glmnet(
+  x = X_matrix,
+  y = survival_data,
+  family = "cox", 
+  alpha = 1     
+)
+
+# extract the coefficients at the optimal lambda (minimum cross-validation error)
+prognostic_signature <- coef(fit_lasso, s = "lambda.min")
+
+# present the final signature (non-zero coefficients are the predictive genes)
+print(prognostic_signature[prognostic_signature[,1] != 0, ])
+
+```
